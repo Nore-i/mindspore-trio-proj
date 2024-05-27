@@ -11,8 +11,9 @@ mindspore
 mindnlp
 sentence_transformers
 huggingface_hub
-# pdfplumber
 chromadb
-# pypdf
 pdftotext
 transformers
+tensorflow
+torch
+tf-keras
