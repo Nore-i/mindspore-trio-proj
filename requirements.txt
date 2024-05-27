@@ -1,0 +1,18 @@
+langchain
+langchain-community
+langchainhub
+langchain-openai
+langchain-chroma
+bs4
+vllm
+langchain-core
+ipywidgets
+mindspore
+mindnlp
+sentence_transformers
+huggingface_hub
+# pdfplumber
+chromadb
+# pypdf
+pdftotext
+transformers
