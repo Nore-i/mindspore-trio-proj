@@ -7,8 +7,7 @@ bs4
 vllm
 langchain-core
 ipywidgets
-mindspore
-mindnlp
+msimilarities
 sentence_transformers
 huggingface_hub
 chromadb
@@ -17,3 +16,5 @@ transformers
 tensorflow
 torch
 tf-keras
+jieba
+gradio
