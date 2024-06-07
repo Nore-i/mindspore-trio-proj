@@ -1,70 +1,467 @@
-import pdfplumber
-import re
-import bibtexparser
+import fnmatch
+from typing import Dict, List, Optional, Union, Tuple, BinaryIO
+import os
+import sys
+import json
+import tempfile
+import copy
+from tqdm.auto import tqdm
+from functools import partial
+from urllib.parse import urlparse
+from pathlib import Path
+import requests
+from hashlib import sha256
+from filelock import FileLock
+import importlib_metadata
+import torch
+import torch.nn as nn
+from torch import Tensor
+import matplotlib.pyplot as plt
+import fnmatch
 
-def extract_title_part_from_pdf(pdf_file):
-    pattern = (r'(^[0-9])|(^research article)|(^article)|(unclassified)|(www\.)|(accepted (from|manuscript))|'
-               r'(proceedings of)|(vol\.)|(volume \d)|(https?://)|(^ieee)|(sciencedirect)|(\d{4}\)$)|'
-               r'(\d{1,4} – \d{1,4}$)|(\d{1,4}-\d{1,4}$)|(cid:)|(^doi:)|(^doi )|(^doi$)|(^doi )|(^doi$)|([0-9])')
+__version__ = "4.0.0"
+_torch_version = importlib_metadata.version("torch")
 
-    with pdfplumber.open(pdf_file) as pdf:
-        first_page = pdf.pages[0]
-        text = first_page.extract_text()
-    
-    lines = text.split("\n")
+hf_cache_home = os.path.expanduser(os.getenv("HF_HOME", os.path.join(
+    os.getenv("XDG_CACHE_HOME", "~/.cache"), "huggingface")))
+default_cache_path = os.path.join(hf_cache_home, "transformers")
+PYTORCH_PRETRAINED_BERT_CACHE = os.getenv(
+    "PYTORCH_PRETRAINED_BERT_CACHE", default_cache_path)
+PYTORCH_TRANSFORMERS_CACHE = os.getenv(
+    "PYTORCH_TRANSFORMERS_CACHE", PYTORCH_PRETRAINED_BERT_CACHE)
+TRANSFORMERS_CACHE = os.getenv(
+    "TRANSFORMERS_CACHE", PYTORCH_TRANSFORMERS_CACHE)
 
-    # Extract title
-    for line in lines:
-        if re.findall(pattern, line.lower()):
-            continue
-        return line
-    return "Unknown title"
+PRESET_MIRROR_DICT = {
+    "tuna": "https://mirrors.tuna.tsinghua.edu.cn/hugging-face-models",
+    "bfsu": "https://mirrors.bfsu.edu.cn/hugging-face-models",
+}
+HUGGINGFACE_CO_PREFIX = "https://hf-mirror.com/{model_id}/resolve/{revision}/{filename}"
+WEIGHTS_NAME = "pytorch_model.bin"
+CONFIG_NAME = "config.json"
 
-def extract_title_part_from_doc(page_content):
-    pattern = (r'(^[0-9])|(^research article)|(^article)|(unclassified)|(www\.)|(accepted (from|manuscript))|'
-               r'(proceedings of)|(vol\.)|(volume \d)|(https?://)|(^ieee)|(sciencedirect)|(\d{4}\)$)|'
-               r'(\d{1,4} – \d{1,4}$)|(\d{1,4}-\d{1,4}$)|(cid:)')
 
-    lines = page_content.split("\n")
-    for line in lines:
-        if re.findall(pattern, line.lower()):
-            continue
-        return line
-    return "Unknown title"
+def visualize_json(json_path):
+    name = json_path.split('/')[-1].split('_')[0]
 
-        
+    with open(json_path, 'r') as file:
+        data = json.load(file)
 
-def remove_braces(text):
-    return re.sub(r'[\{\}]', '', text)
+    epochs = data['epoch']
+    train_loss = data['train_loss']
+    train_acc = data['train_acc']
+    train_f1 = data['train_f1']
+    dev_acc = data['dev_acc']
+    dev_f1 = data['dev_f1']
+    test_acc = data.get('test_acc')
 
-def get_first_author(authors):
-    if authors:
-        first_author = authors.split(' and ')[0]
-        return first_author
-    return ''
+    fig, axs = plt.subplots(2, 2, figsize=(10, 6))
 
-def search_bib(title, bib_file):
-    matches = []
-    if title == 'Unknown title':
-        matches.append(('Unknown title', 'Unknown author'))
-        return matches
-    with open(bib_file, 'r') as file:
-        bib_database = bibtexparser.load(file)
-    
-    for entry in bib_database.entries:
-        entry_title = entry.get('title', '')
-        entry_title_cleaned = remove_braces(entry_title)
-        if title.lower() in entry_title_cleaned.lower():
-            authors = entry.get('author', '')
-            first_author = get_first_author(authors)
-            matches.append((entry_title_cleaned, first_author))
-    if len(matches) == 0:
-        matches.append(('Unknown title', 'Unknown author'))
-    return matches
+    # Plot Train Loss
+    axs[0, 0].plot(epochs, train_loss, label='Train Loss')
+    axs[0, 0].set_xlabel('Epoch')
+    axs[0, 0].set_ylabel('Loss')
+    axs[0, 0].set_title('Train Loss')
+    axs[0, 0].legend()
 
-def get_title_author_from_pdf(pdf_file, bib_file):
-    title_part = extract_title_part_from_pdf(pdf_file)
-    matches = search_bib(title_part, bib_file)
-    if not matches:
-        return (("None", "None"), None)
-    return matches
+    # Plot Train Accuracy
+    axs[0, 1].plot(epochs, train_acc, label='Train Accuracy', color='orange')
+    axs[0, 1].set_xlabel('Epoch')
+    axs[0, 1].set_ylabel('Accuracy')
+    axs[0, 1].set_title('Train Accuracy')
+    axs[0, 1].legend()
+
+    # Plot Train F1 Score
+    axs[1, 0].plot(epochs, train_f1, label='Train F1', color='green')
+    axs[1, 0].set_xlabel('Epoch')
+    axs[1, 0].set_ylabel('F1 Score')
+    axs[1, 0].set_title('Train F1 Score')
+    axs[1, 0].legend()
+
+    # Plot Development Accuracy
+    axs[1, 1].plot(epochs, dev_acc, label='Dev Accuracy', color='red')
+    axs[1, 1].set_xlabel('Epoch')
+    axs[1, 1].set_ylabel('Accuracy')
+    axs[1, 1].set_title('Dev Accuracy')
+    axs[1, 1].legend()
+
+    # Add a central title
+    fig.suptitle(f'Training statistics for {name.upper()}', fontsize=16)
+    plt.tight_layout()
+
+
+def visualize_multitask(json_path):
+    name = json_path.split('/')[-1].split('_')[0]
+
+    with open(json_path, 'r') as file:
+        data = json.load(file)
+
+    epochs = data["epoch"]
+
+    # Training metrics
+    train_loss = data["train_loss"]
+    train_sentiment_acc = data["train_sentiment_acc"]
+    train_paraphrase_acc = data["train_paraphrase_acc"]
+    train_sts_corr = data["train_sts_corr"]
+    train_avg = data["train_avg_normalized_score"]
+
+    # Test metrics
+    test_sentiment_accuracy = data["test_sentiment_accuracy"]
+    test_paraphrase_accuracy = data["test_paraphrase_accuracy"]
+    test_sts_corr = data["test_sts_corr"]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 6))
+
+    # First figure - Dev metrics
+    # ax1.plot(epochs, train_loss, label='Train Loss')
+    ax1.plot(epochs, train_sentiment_acc,
+             label='Dev Sentiment Accuracy', linewidth=2)
+    ax1.plot(epochs, train_paraphrase_acc,
+             label='Dev Paraphrase Accuracy', linewidth=2)
+    ax1.plot(epochs, train_sts_corr, label='Dev STS Correlation', linewidth=2)
+    # ax1.plot(epochs, train_avg, label='Dev Avg Score')
+    ax1.set_title(f'Training Metrics for {name.upper()}', fontsize=14)
+    ax1.set_xlabel('Epochs', fontsize=12)
+    ax1.set_ylabel('Metrics', fontsize=12)
+    ax1.legend(fontsize=14)
+    ax1.grid(True)
+
+    # Second figure - Training Loss
+    ax2.plot(epochs, train_loss, label='Training Loss', linewidth=2)
+    # ax2.plot(epochs, test_paraphrase_accuracy,
+    #          label='Test Paraphrase Accuracy')
+    # ax2.plot(epochs, test_sts_corr, label='Test STS Correlation')
+    ax2.set_title(f'Training loss for {name.upper()}', fontsize=14)
+    ax2.set_xlabel('Epochs', fontsize=12)
+    ax2.set_ylabel('Loss', fontsize=12)
+    ax2.legend(fontsize=14)
+    ax2.grid(True)
+
+    plt.tight_layout()
+    plt.show()
+
+    return test_sentiment_accuracy, test_paraphrase_accuracy, test_sts_corr
+
+
+def is_torch_available():
+    return True
+
+
+def is_tf_available():
+    return False
+
+
+def is_remote_url(url_or_filename):
+    parsed = urlparse(url_or_filename)
+    return parsed.scheme in ("http", "https")
+
+
+def http_get(url: str, temp_file: BinaryIO, proxies=None, resume_size=0, headers: Optional[Dict[str, str]] = None):
+    headers = copy.deepcopy(headers)
+    if resume_size > 0:
+        headers["Range"] = "bytes=%d-" % (resume_size,)
+    r = requests.get(url, stream=True, proxies=proxies, headers=headers)
+    r.raise_for_status()
+    content_length = r.headers.get("Content-Length")
+    total = resume_size + \
+        int(content_length) if content_length is not None else None
+    progress = tqdm(
+        unit="B",
+        unit_scale=True,
+        total=total,
+        initial=resume_size,
+        desc="Downloading",
+        disable=False,
+    )
+    for chunk in r.iter_content(chunk_size=1024):
+        if chunk:  # filter out keep-alive new chunks
+            progress.update(len(chunk))
+            temp_file.write(chunk)
+    progress.close()
+
+
+def url_to_filename(url: str, etag: Optional[str] = None) -> str:
+    url_bytes = url.encode("utf-8")
+    filename = sha256(url_bytes).hexdigest()
+
+    if etag:
+        etag_bytes = etag.encode("utf-8")
+        filename += "." + sha256(etag_bytes).hexdigest()
+
+    if url.endswith(".h5"):
+        filename += ".h5"
+
+    return filename
+
+
+def hf_bucket_url(
+    model_id: str, filename: str, subfolder: Optional[str] = None, revision: Optional[str] = None, mirror=None
+) -> str:
+    if subfolder is not None:
+        filename = f"{subfolder}/{filename}"
+
+    if mirror:
+        endpoint = PRESET_MIRROR_DICT.get(mirror, mirror)
+        legacy_format = "/" not in model_id
+        if legacy_format:
+            return f"{endpoint}/{model_id}-{filename}"
+        else:
+            return f"{endpoint}/{model_id}/{filename}"
+
+    if revision is None:
+        revision = "main"
+    return HUGGINGFACE_CO_PREFIX.format(model_id=model_id, revision=revision, filename=filename)
+
+
+def http_user_agent(user_agent: Union[Dict, str, None] = None) -> str:
+    ua = "transformers/{}; python/{}".format(
+        __version__, sys.version.split()[0])
+    if is_torch_available():
+        ua += f"; torch/{_torch_version}"
+    if is_tf_available():
+        ua += f"; tensorflow/{_tf_version}"
+    if isinstance(user_agent, dict):
+        ua += "; " + "; ".join("{}/{}".format(k, v)
+                               for k, v in user_agent.items())
+    elif isinstance(user_agent, str):
+        ua += "; " + user_agent
+    return ua
+
+
+def get_from_cache(
+    url: str,
+    cache_dir=None,
+    force_download=False,
+    proxies=None,
+    etag_timeout=10,
+    resume_download=False,
+    user_agent: Union[Dict, str, None] = None,
+    use_auth_token: Union[bool, str, None] = None,
+    local_files_only=False,
+) -> Optional[str]:
+    if cache_dir is None:
+        cache_dir = TRANSFORMERS_CACHE
+    if isinstance(cache_dir, Path):
+        cache_dir = str(cache_dir)
+
+    os.makedirs(cache_dir, exist_ok=True)
+
+    headers = {"user-agent": http_user_agent(user_agent)}
+    if isinstance(use_auth_token, str):
+        headers["authorization"] = "Bearer {}".format(use_auth_token)
+    elif use_auth_token:
+        token = HfFolder.get_token()
+        if token is None:
+            raise EnvironmentError(
+                "You specified use_auth_token=True, but a huggingface token was not found.")
+        headers["authorization"] = "Bearer {}".format(token)
+
+    url_to_download = url
+    etag = None
+    if not local_files_only:
+        try:
+            r = requests.head(url, headers=headers, allow_redirects=False,
+                              proxies=proxies, timeout=etag_timeout)
+            r.raise_for_status()
+            etag = r.headers.get("X-Linked-Etag") or r.headers.get("ETag")
+            # We favor a custom header indicating the etag of the linked resource, and
+            # we fallback to the regular etag header.
+            # If we don't have any of those, raise an error.
+            if etag is None:
+                raise OSError(
+                    "Distant resource does not have an ETag, we won't be able to reliably ensure reproducibility."
+                )
+            # In case of a redirect,
+            # save an extra redirect on the request.get call,
+            # and ensure we download the exact atomic version even if it changed
+            # between the HEAD and the GET (unlikely, but hey).
+            if 300 <= r.status_code <= 399:
+                url_to_download = r.headers["Location"]
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+            # etag is already None
+            pass
+
+    filename = url_to_filename(url, etag)
+
+    # get cache path to put the file
+    cache_path = os.path.join(cache_dir, filename)
+
+    # etag is None == we don't have a connection or we passed local_files_only.
+    # try to get the last downloaded one
+    if etag is None:
+        if os.path.exists(cache_path):
+            return cache_path
+        else:
+            matching_files = [
+                file
+                for file in fnmatch.filter(os.listdir(cache_dir), filename.split(".")[0] + ".*")
+                if not file.endswith(".json") and not file.endswith(".lock")
+            ]
+            if len(matching_files) > 0:
+                return os.path.join(cache_dir, matching_files[-1])
+            else:
+                # If files cannot be found and local_files_only=True,
+                # the models might've been found if local_files_only=False
+                # Notify the user about that
+                if local_files_only:
+                    raise FileNotFoundError(
+                        "Cannot find the requested files in the cached path and outgoing traffic has been"
+                        " disabled. To enable model look-ups and downloads online, set 'local_files_only'"
+                        " to False."
+                    )
+                else:
+                    raise ValueError(
+                        "Connection error, and we cannot find the requested files in the cached path."
+                        " Please try again or make sure your Internet connection is on."
+                    )
+
+    # From now on, etag is not None.
+    if os.path.exists(cache_path) and not force_download:
+        return cache_path
+
+    # Prevent parallel downloads of the same file with a lock.
+    lock_path = cache_path + ".lock"
+    with FileLock(lock_path):
+
+        # If the download just completed while the lock was activated.
+        if os.path.exists(cache_path) and not force_download:
+            # Even if returning early like here, the lock will be released.
+            return cache_path
+
+        if resume_download:
+            incomplete_path = cache_path + ".incomplete"
+
+            @contextmanager
+            def _resumable_file_manager() -> "io.BufferedWriter":
+                with open(incomplete_path, "ab") as f:
+                    yield f
+
+            temp_file_manager = _resumable_file_manager
+            if os.path.exists(incomplete_path):
+                resume_size = os.stat(incomplete_path).st_size
+            else:
+                resume_size = 0
+        else:
+            temp_file_manager = partial(
+                tempfile.NamedTemporaryFile, mode="wb", dir=cache_dir, delete=False)
+            resume_size = 0
+
+        # Download to temporary file, then copy to cache dir once finished.
+        # Otherwise you get corrupt cache entries if the download gets interrupted.
+        with temp_file_manager() as temp_file:
+            http_get(url_to_download, temp_file, proxies=proxies,
+                     resume_size=resume_size, headers=headers)
+
+        os.replace(temp_file.name, cache_path)
+
+        meta = {"url": url, "etag": etag}
+        meta_path = cache_path + ".json"
+        with open(meta_path, "w") as meta_file:
+            json.dump(meta, meta_file)
+
+    return cache_path
+
+
+def cached_path(
+    url_or_filename,
+    cache_dir=None,
+    force_download=False,
+    proxies=None,
+    resume_download=False,
+    user_agent: Union[Dict, str, None] = None,
+    extract_compressed_file=False,
+    force_extract=False,
+    use_auth_token: Union[bool, str, None] = None,
+    local_files_only=False,
+) -> Optional[str]:
+    if cache_dir is None:
+        cache_dir = TRANSFORMERS_CACHE
+    if isinstance(url_or_filename, Path):
+        url_or_filename = str(url_or_filename)
+    if isinstance(cache_dir, Path):
+        cache_dir = str(cache_dir)
+
+    if is_remote_url(url_or_filename):
+        # URL, so get it from the cache (downloading if necessary)
+        output_path = get_from_cache(
+            url_or_filename,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            proxies=proxies,
+            resume_download=resume_download,
+            user_agent=user_agent,
+            use_auth_token=use_auth_token,
+            local_files_only=local_files_only,
+        )
+    elif os.path.exists(url_or_filename):
+        # File, and it exists.
+        output_path = url_or_filename
+    elif urlparse(url_or_filename).scheme == "":
+        # File, but it doesn't exist.
+        raise EnvironmentError("file {} not found".format(url_or_filename))
+    else:
+        # Something unknown
+        raise ValueError(
+            "unable to parse {} as a URL or as a local path".format(url_or_filename))
+
+    if extract_compressed_file:
+        if not is_zipfile(output_path) and not tarfile.is_tarfile(output_path):
+            return output_path
+
+        # Path where we extract compressed archives
+        # We avoid '.' in dir name and add "-extracted" at the end: "./model.zip" => "./model-zip-extracted/"
+        output_dir, output_file = os.path.split(output_path)
+        output_extract_dir_name = output_file.replace(".", "-") + "-extracted"
+        output_path_extracted = os.path.join(
+            output_dir, output_extract_dir_name)
+
+        if os.path.isdir(output_path_extracted) and os.listdir(output_path_extracted) and not force_extract:
+            return output_path_extracted
+
+        # Prevent parallel extractions
+        lock_path = output_path + ".lock"
+        with FileLock(lock_path):
+            shutil.rmtree(output_path_extracted, ignore_errors=True)
+            os.makedirs(output_path_extracted)
+            if is_zipfile(output_path):
+                with ZipFile(output_path, "r") as zip_file:
+                    zip_file.extractall(output_path_extracted)
+                    zip_file.close()
+            elif tarfile.is_tarfile(output_path):
+                tar_file = tarfile.open(output_path)
+                tar_file.extractall(output_path_extracted)
+                tar_file.close()
+            else:
+                raise EnvironmentError(
+                    "Archive format of {} could not be identified".format(output_path))
+
+        return output_path_extracted
+
+    return output_path
+
+
+def get_parameter_dtype(parameter: Union[nn.Module]):
+    try:
+        return next(parameter.parameters()).dtype
+    except StopIteration:
+        # For nn.DataParallel compatibility in PyTorch 1.5
+
+        def find_tensor_attributes(module: nn.Module) -> List[Tuple[str, Tensor]]:
+            tuples = [(k, v)
+                      for k, v in module.__dict__.items() if torch.is_tensor(v)]
+            return tuples
+
+        gen = parameter._named_members(get_members_fn=find_tensor_attributes)
+        first_tuple = next(gen)
+        return first_tuple[1].dtype
+
+
+def get_extended_attention_mask(attention_mask: Tensor, dtype) -> Tensor:
+    # attention_mask [batch_size, seq_length]
+    assert attention_mask.dim() == 2
+    # [batch_size, 1, 1, seq_length] for multi-head attention
+    extended_attention_mask = attention_mask[:, None, None, :]
+    extended_attention_mask = extended_attention_mask.to(
+        dtype=dtype)  # fp16 compatibility
+    extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
+    return extended_attention_mask
